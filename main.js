@@ -173,29 +173,46 @@ async function backupExistingMessages(token, DB, channelId, userId) {
 
       if (forwardResult.ok) {
         consecutiveFailures = 0; // Reset counter
-
-        // Delete the forwarded message
-        await telegramRequest(token, 'deleteMessage', {
-          chat_id: channelId,
-          message_id: forwardResult.result.message_id
-        });
+        
+        const fwdMsg = forwardResult.result;
 
         // Check if already backed up
         if (await isMessageBackedUp(DB, channelId, msgId)) {
+          // Delete the forwarded message
+          await telegramRequest(token, 'deleteMessage', {
+            chat_id: channelId,
+            message_id: fwdMsg.message_id
+          });
           skippedCount++;
           continue;
         }
 
-        // Save backup
+        // Save backup with full message data
         const backupData = {
           message_id: msgId,
-          date: forwardResult.result.date || Date.now(),
+          date: fwdMsg.date || Date.now(),
+          text: fwdMsg.text,
+          caption: fwdMsg.caption,
+          photo: fwdMsg.photo ? fwdMsg.photo[fwdMsg.photo.length - 1].file_id : null,
+          video: fwdMsg.video ? fwdMsg.video.file_id : null,
+          document: fwdMsg.document ? fwdMsg.document.file_id : null,
+          audio: fwdMsg.audio ? fwdMsg.audio.file_id : null,
+          voice: fwdMsg.voice ? fwdMsg.voice.file_id : null,
+          video_note: fwdMsg.video_note ? fwdMsg.video_note.file_id : null,
+          sticker: fwdMsg.sticker ? fwdMsg.sticker.file_id : null,
+          animation: fwdMsg.animation ? fwdMsg.animation.file_id : null,
           backed_up: true,
           original_exists: true
         };
 
         await saveBackupMessage(DB, channelId, msgId, backupData);
         backedUpCount++;
+        
+        // Delete the forwarded message after saving data
+        await telegramRequest(token, 'deleteMessage', {
+          chat_id: channelId,
+          message_id: fwdMsg.message_id
+        });
 
         // Update status every 5 seconds or every 10 messages
         const now = Date.now();
@@ -289,12 +306,12 @@ async function restoreBackupWithProgress(token, DB, sourceChannelId, targetChann
         restored++;
       }
       
-      // Update progress every 5 seconds or every 10 messages
+      // Update progress every 3 seconds or every 5 messages
       const now = Date.now();
-      if (statusMessageId && (now - lastUpdateTime > 5000 || restored % 10 === 0)) {
+      if (statusMessageId && (now - lastUpdateTime > 3000 || restored % 5 === 0)) {
         lastUpdateTime = now;
         
-        const progress = Math.round((restored / totalCount) * 100);
+        const progress = Math.round(((restored + failed) / totalCount) * 100);
         const barFilled = Math.floor(progress / 5);
         const barEmpty = 20 - barFilled;
         
@@ -308,14 +325,14 @@ async function restoreBackupWithProgress(token, DB, sourceChannelId, targetChann
             `━${'█'.repeat(barFilled)}${'░'.repeat(barEmpty)}━\n\n` +
             `✅ منتقل شده: ${restored} از ${totalCount}\n` +
             (failed > 0 ? `❌ ناموفق: ${failed}\n` : '') +
-            `⏱ باقیمانده: ${totalCount - restored} پیام\n\n` +
+            `⏱ باقیمانده: ${totalCount - restored - failed} پیام\n\n` +
             '⏳ لطفا صبر کنید...',
           parse_mode: 'HTML'
         });
       }
       
-      // Rate limiting
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // Reduced delay for faster transfer
+      await new Promise(resolve => setTimeout(resolve, 50));
       
     } catch (err) {
       console.error('Error restoring message:', err);
