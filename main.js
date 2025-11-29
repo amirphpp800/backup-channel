@@ -339,6 +339,44 @@ export async function handleUpdate(update, env, context) {
     return;
   }
   
+  // Handle callback queries (button clicks)
+  if (update.callback_query) {
+    const callbackQuery = update.callback_query;
+    const userId = callbackQuery.from.id;
+    const chatId = callbackQuery.message.chat.id;
+    const data = callbackQuery.callback_data;
+    
+    // Answer callback query to remove loading state
+    await telegramRequest(token, 'answerCallbackQuery', {
+      callback_query_id: callbackQuery.id
+    });
+    
+    if (data.startsWith('restore_source:')) {
+      const sourceId = data.replace('restore_source:', '');
+      
+      // Save selected source channel
+      await DB.put(`restore_temp:${userId}:source`, sourceId);
+      
+      const userData = await getUserData(DB, userId);
+      const sourceChannel = userData.channels.find(ch => ch.id === sourceId);
+      
+      await sendMessage(token, chatId,
+        '✅ <b>کانال مبدا انتخاب شد</b>\n\n' +
+        '📺 ' + (sourceChannel ? sourceChannel.title : sourceId) + '\n\n' +
+        '🔹 <b>مرحله 2:</b> ID یا username کانال مقصد را ارسال کنید:\n\n' +
+        'مثال:\n' +
+        '• <code>@newchannel</code>\n' +
+        '• <code>-1001234567890</code>\n\n' +
+        '⚠️ ربات باید در کانال مقصد ادمین باشد.'
+      );
+      
+      // Set state for next message
+      await DB.put(`restore_state:${userId}`, 'waiting_target');
+    }
+    
+    return;
+  }
+  
   const message = update.message || update.channel_post;
   if (!message) return;
   
@@ -355,22 +393,101 @@ export async function handleUpdate(update, env, context) {
   // Handle private messages (bot commands)
   if (!userId) return;
   
+  // Check if user is in restore flow
+  const restoreState = await DB.get(`restore_state:${userId}`);
+  
+  if (restoreState === 'waiting_target' && text && !text.startsWith('/')) {
+    const sourceId = await DB.get(`restore_temp:${userId}:source`);
+    const targetId = await resolveChannelId(token, text.trim());
+    
+    if (!targetId) {
+      await sendMessage(token, chatId, 
+        '❌ فرمت کانال نامعتبر است!\n\n' +
+        'لطفا ID یا username صحیح وارد کنید.'
+      );
+      return;
+    }
+    
+    try {
+      const sourceChat = await telegramRequest(token, 'getChat', { chat_id: sourceId });
+      const targetChat = await telegramRequest(token, 'getChat', { chat_id: targetId });
+      
+      if (!sourceChat.ok || !targetChat.ok) {
+        await sendMessage(token, chatId, 
+          '❌ خطا در دسترسی!\n\n' +
+          'مطمئن شوید ربات در هر دو کانال ادمین است.'
+        );
+        return;
+      }
+      
+      const backupCount = (await DB.list({ prefix: `backup:${sourceId}:` })).keys.length;
+      
+      if (backupCount === 0) {
+        await sendMessage(token, chatId, '❌ هیچ بکاپی یافت نشد!');
+        await DB.delete(`restore_state:${userId}`);
+        await DB.delete(`restore_temp:${userId}:source`);
+        return;
+      }
+      
+      await sendMessage(token, chatId, 
+        '⏳ <b>شروع بازیابی...</b>\n\n' +
+        '📺 مبدا: <b>' + sourceChat.result.title + '</b>\n' +
+        '📺 مقصد: <b>' + targetChat.result.title + '</b>\n' +
+        '💾 تعداد: ' + backupCount + '\n\n' +
+        'این فرآیند ممکن است چند دقیقه طول بکشد...'
+      );
+      
+      // Start background restore
+      context.waitUntil(
+        (async () => {
+          const restored = await restoreBackup(token, DB, sourceId, targetId);
+          
+          await sendMessage(token, userId, 
+            '✅ <b>بازیابی تکمیل شد!</b>\n\n' +
+            '📊 منتقل شده: ' + restored + ' پیام\n' +
+            '📺 مقصد: <b>' + targetChat.result.title + '</b>\n\n' +
+            '🎉 تمام بکاپ‌ها با موفقیت به کانال جدید منتقل شدند!'
+          );
+        })()
+      );
+      
+      // Clean up state
+      await DB.delete(`restore_state:${userId}`);
+      await DB.delete(`restore_temp:${userId}:source`);
+      
+    } catch (err) {
+      console.error('Restore error:', err);
+      await sendMessage(token, chatId, 
+        '❌ خطا در بازیابی!\n\n' +
+        'خطا: ' + err.message
+      );
+      await DB.delete(`restore_state:${userId}`);
+      await DB.delete(`restore_temp:${userId}:source`);
+    }
+    
+    return;
+  }
+  
   if (text.startsWith('/start')) {
     await sendMessage(token, chatId, 
       '🤖 <b>به ربات بکاپ‌گیری کانال خوش آمدید!</b>\n\n' +
       '📋 <b>دستورات موجود:</b>\n' +
-      '/addchannel [کانال] - افزودن کانال جدید\n' +
-      '/channels - لیست کانال‌های شما\n' +
-      '/backup - مشاهده تعداد بکاپ‌ها\n' +
-      '/trust [کانال] - نمایش 50 پیام آخر بکاپ\n' +
-      '/restore - انتقال بکاپ به کانال جدید\n' +
+      '/addchannel [کانال] - افزودن کانال\n' +
+      '/manualbackup [کانال] - بکاپ دستی\n' +
+      '/channels - لیست کانال‌ها\n' +
+      '/backup - مشاهده بکاپ‌ها\n' +
+      '/trust [کانال] - نمایش 50 پیام آخر\n' +
+      '/restore - انتقال بکاپ (با دکمه)\n' +
       '/removechannel [کانال] - حذف کانال\n' +
       '/help - راهنمای کامل\n\n' +
       '💡 <b>نحوه استفاده:</b>\n' +
       '• <code>/addchannel @mychannel</code>\n' +
-      '• <code>/addchannel -1001234567890</code>\n' +
-      '• <code>/trust @mychannel</code>\n\n' +
-      '✨ <b>ویژگی جدید:</b> هنگام افزودن کانال، تمام پیام‌های قبلی نیز به صورت خودکار بکاپ می‌شود!'
+      '• <code>/manualbackup @mychannel</code>\n' +
+      '• سپس پیام‌ها را فوروارد کنید\n\n' +
+      '✨ <b>ویژگی‌های جدید:</b>\n' +
+      '🔹 بکاپ خودکار پیام‌های قبلی\n' +
+      '🔹 بکاپ دستی با فوروارد\n' +
+      '🔹 انتقال آسان با دکمه شیشه‌ای'
     );
   }
   
@@ -706,71 +823,121 @@ export async function handleUpdate(update, env, context) {
     );
   }
   
-  else if (text.startsWith('/restore')) {
+  else if (text.startsWith('/manualbackup')) {
     const parts = text.trim().split(/\s+/);
     
-    if (parts.length < 3) {
-      await sendMessage(token, chatId, 
-        '📤 <b>راهنمای بازیابی:</b>\n\n' +
-        '<code>/restore [مبدا] [مقصد]</code>\n\n' +
-        'مثال:\n' +
-        '<code>/restore @old @new</code>\n\n' +
-        '⚠️ ربات باید در هر دو کانال ادمین باشد'
+    if (parts.length < 2) {
+      await sendMessage(token, chatId,
+        '📥 <b>راهنمای بکاپ دستی:</b>\n\n' +
+        '<code>/manualbackup [کانال]</code>\n\n' +
+        'مثال: <code>/manualbackup @mychannel</code>\n\n' +
+        '💡 در صورت شکست بکاپ خودکار، پیام‌ها را از کانال به ربات فوروارد کنید.\n' +
+        'ربات به صورت خودکار آن‌ها را ذخیره می‌کند.'
       );
       return;
     }
     
-    const sourceInput = parts[1];
-    const targetInput = parts[2];
+    const channelInput = parts[1];
+    const channelId = await resolveChannelId(token, channelInput);
     
-    const sourceId = await resolveChannelId(token, sourceInput);
-    const targetId = await resolveChannelId(token, targetInput);
-    
-    if (!sourceId || !targetId) {
-      await sendMessage(token, chatId, '❌ فرمت کانال‌ها نامعتبر است!');
+    if (!channelId) {
+      await sendMessage(token, chatId, '❌ فرمت کانال نامعتبر است!');
       return;
     }
     
-    try {
-      const sourceChat = await telegramRequest(token, 'getChat', { chat_id: sourceId });
-      const targetChat = await telegramRequest(token, 'getChat', { chat_id: targetId });
+    const userData = await getUserData(DB, userId);
+    const channel = userData.channels.find(ch => ch.id === channelId);
+    
+    if (!channel) {
+      await sendMessage(token, chatId, 
+        '❌ این کانال در لیست شما یافت نشد!\n\n' +
+        'ابتدا با <code>/addchannel</code> اضافه کنید.'
+      );
+      return;
+    }
+    
+    // Set manual backup mode
+    await DB.put(`manual_backup:${userId}`, channelId);
+    
+    await sendMessage(token, chatId,
+      '✅ <b>حالت بکاپ دستی فعال شد!</b>\n\n' +
+      '📺 کانال: <b>' + channel.title + '</b>\n\n' +
+      '📝 <b>راهنما:</b>\n' +
+      '1️⃣ به کانال خود بروید\n' +
+      '2️⃣ پیام‌های مورد نظر را انتخاب کنید\n' +
+      '3️⃣ آن‌ها را به این ربات فوروارد کنید\n\n' +
+      '💾 ربات به صورت خودکار پیام‌های فوروارد شده را بکاپ می‌گیرد.\n\n' +
+      '⏹ برای توقف: <code>/stopmanual</code>'
+    );
+  }
+  
+  else if (text.startsWith('/stopmanual')) {
+    await DB.delete(`manual_backup:${userId}`);
+    await sendMessage(token, chatId, 
+      '⏹ <b>حالت بکاپ دستی غیرفعال شد.</b>\n\n' +
+      'پیام‌های فوروارد شده دیگر ذخیره نمی‌شوند.'
+    );
+  }
+  
+  else if (text.startsWith('/restore')) {
+    const userData = await getUserData(DB, userId);
+    
+    if (userData.channels.length === 0) {
+      await sendMessage(token, chatId, '❌ شما هنوز کانالی اضافه نکرده‌اید.');
+      return;
+    }
+    
+    // Create inline keyboard with channels
+    const keyboard = {
+      inline_keyboard: userData.channels.map(ch => [{
+        text: `📺 ${ch.title}`,
+        callback_data: `restore_source:${ch.id}`
+      }])
+    };
+    
+    await sendMessage(token, chatId, 
+      '📤 <b>انتقال بکاپ به کانال جدید</b>\n\n' +
+      '🔹 <b>مرحله 1:</b> کانال مبدا را انتخاب کنید:\n\n' +
+      '(کانالی که بکاپ‌هایش را می‌خواهید منتقل کنید)',
+      { reply_markup: keyboard }
+    );
+  }
+  
+  else if (message.forward_from_chat) {
+    // Handle forwarded messages for manual backup
+    const manualBackupChannel = await DB.get(`manual_backup:${userId}`);
+    
+    if (manualBackupChannel && message.forward_from_chat.id.toString() === manualBackupChannel) {
+      const forwardedMsg = message;
+      const channelId = message.forward_from_chat.id;
+      const originalMessageId = message.forward_from_message_id;
       
-      if (!sourceChat.ok || !targetChat.ok) {
-        await sendMessage(token, chatId, 
-          '❌ خطا در دسترسی!\n\n' +
-          'مطمئن شوید ربات در هر دو کانال ادمین است.'
-        );
+      // Check if already backed up
+      if (await isMessageBackedUp(DB, channelId, originalMessageId)) {
+        await sendMessage(token, chatId, '⚠️ این پیام قبلا بکاپ گرفته شده است.');
         return;
       }
       
-      const backupCount = (await DB.list({ prefix: `backup:${sourceId}:` })).keys.length;
+      // Save manual backup
+      const backupData = {
+        message_id: originalMessageId,
+        date: forwardedMsg.forward_date || Date.now(),
+        text: forwardedMsg.text,
+        caption: forwardedMsg.caption,
+        photo: forwardedMsg.photo ? forwardedMsg.photo[forwardedMsg.photo.length - 1].file_id : null,
+        video: forwardedMsg.video ? forwardedMsg.video.file_id : null,
+        document: forwardedMsg.document ? forwardedMsg.document.file_id : null,
+        audio: forwardedMsg.audio ? forwardedMsg.audio.file_id : null,
+        voice: forwardedMsg.voice ? forwardedMsg.voice.file_id : null,
+        backed_up: true,
+        manual_backup: true
+      };
       
-      if (backupCount === 0) {
-        await sendMessage(token, chatId, '❌ هیچ بکاپی یافت نشد!');
-        return;
-      }
+      await saveBackupMessage(DB, channelId, originalMessageId, backupData);
       
       await sendMessage(token, chatId, 
-        '⏳ <b>شروع بازیابی...</b>\n\n' +
-        '📺 مبدا: <b>' + sourceChat.result.title + '</b>\n' +
-        '📺 مقصد: <b>' + targetChat.result.title + '</b>\n' +
-        '💾 تعداد: ' + backupCount + '\n\n' +
-        'لطفا صبر کنید...'
-      );
-      
-      const restored = await restoreBackup(token, DB, sourceId, targetId);
-      
-      await sendMessage(token, chatId, 
-        '✅ <b>بازیابی تکمیل شد!</b>\n\n' +
-        '📊 منتقل شده: ' + restored + ' پیام\n' +
-        '📺 مقصد: <b>' + targetChat.result.title + '</b>'
-      );
-      
-    } catch (err) {
-      console.error('Restore error:', err);
-      await sendMessage(token, chatId, 
-        '❌ خطا در بازیابی!\n\n' +
-        'خطا: ' + err.message
+        '✅ بکاپ شد!\n\n' +
+        '📄 پیام #' + originalMessageId
       );
     }
   }
@@ -785,25 +952,33 @@ export async function handleUpdate(update, env, context) {
       '3️⃣ دستور: <code>/addchannel @channel</code>\n\n' +
       '<b>📋 دستورات:</b>\n\n' +
       '<b>/addchannel [کانال]</b>\n' +
-      '↳ افزودن کانال + بکاپ پیام‌های قبلی\n\n' +
+      '↳ افزودن کانال + بکاپ خودکار\n\n' +
+      '<b>/manualbackup [کانال]</b>\n' +
+      '↳ بکاپ دستی با فوروارد پیام‌ها\n\n' +
       '<b>/channels</b>\n' +
       '↳ لیست کانال‌ها و آمار\n\n' +
       '<b>/backup</b>\n' +
       '↳ مشاهده تعداد بکاپ‌ها\n\n' +
       '<b>/trust [کانال]</b>\n' +
       '↳ نمایش 50 پیام آخر\n\n' +
-      '<b>/restore [مبدا] [مقصد]</b>\n' +
-      '↳ انتقال بکاپ به کانال جدید\n\n' +
+      '<b>/restore</b>\n' +
+      '↳ انتقال بکاپ با دکمه (مرحله‌ای)\n\n' +
       '<b>/removechannel [کانال]</b>\n' +
       '↳ حذف کانال از لیست\n\n' +
       '━━━━━━━━━━━━━━━━\n\n' +
       '<b>✨ ویژگی‌ها:</b>\n' +
       '✅ بکاپ خودکار پیام‌های جدید\n' +
       '✅ بکاپ پیام‌های قبلی هنگام افزودن\n' +
+      '✅ بکاپ دستی با فوروارد\n' +
+      '✅ انتقال آسان با دکمه شیشه‌ای\n' +
       '✅ متن، عکس، ویدیو، فایل، صوت\n' +
       '✅ فایل‌های تا 25MB\n' +
       '✅ مدیریت چند کانال\n' +
       '✅ حفظ ترتیب در بازیابی\n\n' +
+      '<b>📥 بکاپ دستی:</b>\n' +
+      '1️⃣ <code>/manualbackup @channel</code>\n' +
+      '2️⃣ پیام‌ها را از کانال فوروارد کنید\n' +
+      '3️⃣ <code>/stopmanual</code> برای پایان\n\n' +
       '<b>⚠️ نکات:</b>\n' +
       '• ربات باید ادمین باشد\n' +
       '• دسترسی "حذف پیام" ضروری است\n' +
