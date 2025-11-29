@@ -1337,7 +1337,7 @@ export async function handleUpdate(update, env, context) {
         }
         
         // Start background restore
-        ctx.waitUntil(
+        context.waitUntil(
           (async () => {
             const restored = await restoreBackupWithProgress(
               token, 
